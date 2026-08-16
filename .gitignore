@@ -1,0 +1,10 @@
+# 输出目录 / output
+LivePhotos/
+output/
+
+# ffmpeg 临时文件
+*.tmp
+
+# IDE
+.vscode/
+.idea/
