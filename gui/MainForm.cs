@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
 using System.Text;
-using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace Mp4ToMicroVideo
@@ -29,6 +31,7 @@ namespace Mp4ToMicroVideo
         private TextBox txtLog;
         private string ffmpegPath, ffprobePath;
         private List<VideoItem> videos = new List<VideoItem>();
+        private BackgroundWorker scanWorker, convWorker;
 
         // Exif 模板 (小米 MVIMG, base64)
         private static readonly byte[] ExifTemplate = Convert.FromBase64String(
@@ -53,7 +56,7 @@ namespace Mp4ToMicroVideo
                     if (fbd.ShowDialog() == DialogResult.OK) { txtDir.Text = fbd.SelectedPath; }
                 }
             };
-            btnScan.Click += (s, e) => Scan();
+            btnScan.Click += (s, e) => StartScan();
             panel.Controls.AddRange(new Control[] { txtDir, btnBrowse, btnScan });
 
             grid = new DataGridView
@@ -86,14 +89,27 @@ namespace Mp4ToMicroVideo
             mid.Controls.Add(lblCount);
 
             btnConvert = new Button { Text = "转换为动态照片", Dock = DockStyle.Bottom, Height = 36, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold), BackColor = Color.LightGreen };
-            btnConvert.Click += (s, e) => ConvertAll();
+            btnConvert.Click += (s, e) => StartConvert();
 
             Controls.Add(mid);
             Controls.Add(bottom);
             Controls.Add(panel);
             Controls.Add(btnConvert);
 
-            // ffmpeg 自动探测
+            // 后台 worker: 扫描
+            scanWorker = new BackgroundWorker();
+            scanWorker.WorkerReportsProgress = true;
+            scanWorker.DoWork += ScanWorker_DoWork;
+            scanWorker.ProgressChanged += ScanWorker_Progress;
+            scanWorker.RunWorkerCompleted += ScanWorker_Completed;
+
+            // 后台 worker: 转换
+            convWorker = new BackgroundWorker();
+            convWorker.WorkerReportsProgress = true;
+            convWorker.DoWork += ConvWorker_DoWork;
+            convWorker.ProgressChanged += ConvWorker_Progress;
+            convWorker.RunWorkerCompleted += ConvWorker_Completed;
+
             DetectFfmpeg();
         }
 
@@ -109,7 +125,6 @@ namespace Mp4ToMicroVideo
             {
                 if (File.Exists(c)) { ffmpegPath = c; break; }
             }
-            // PATH 里找
             if (ffmpegPath == null)
             {
                 var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";
@@ -134,35 +149,74 @@ namespace Mp4ToMicroVideo
             }
         }
 
-        private void Scan()
+        // ================= 扫描 (后台线程) =================
+
+        private void StartScan()
         {
             var dir = txtDir.Text.Trim();
             if (dir.Length == 0 || !Directory.Exists(dir)) { MessageBox.Show("请选择有效的文件夹"); return; }
             if (ffprobePath == null) { MessageBox.Show("未找到 ffprobe，无法扫描"); return; }
+            if (scanWorker.IsBusy) return;
 
             videos.Clear();
             grid.Rows.Clear();
             lblStatus.Text = "扫描中...";
-            Application.DoEvents();
+            btnScan.Enabled = false;
+            btnConvert.Enabled = false;
+            scanWorker.RunWorkerAsync(dir);
+        }
 
+        private void ScanWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            var worker = (BackgroundWorker)sender;
+            string dir = (string)e.Argument;
             string[] exts = { ".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm", ".m4v", ".ts", ".mpg", ".3gp" };
             var files = new List<string>();
             try { foreach (var f in Directory.GetFiles(dir)) { var ext = Path.GetExtension(f).ToLower(); if (Array.IndexOf(exts, ext) >= 0) files.Add(f); } }
-            catch (Exception ex) { MessageBox.Show("读取文件夹失败: " + ex.Message); return; }
+            catch (Exception ex) { e.Result = "读取文件夹失败: " + ex.Message; return; }
 
-            int count3s = 0;
-            foreach (var f in files)
+            var found = new List<VideoItem>();
+            for (int idx = 0; idx < files.Count; idx++)
             {
-                double dur = GetDuration(f);
+                if (worker.CancellationPending) break;
+                double dur = GetDuration(files[idx]);
                 if (dur >= 2.5 && dur <= 3.5)
                 {
-                    videos.Add(new VideoItem { Path = f, Name = Path.GetFileName(f), Duration = dur, Size = new FileInfo(f).Length, Selected = true });
-                    count3s++;
+                    found.Add(new VideoItem { Path = files[idx], Name = Path.GetFileName(files[idx]), Duration = dur, Size = new FileInfo(files[idx]).Length, Selected = true });
                 }
+                worker.ReportProgress((idx + 1) * 100 / Math.Max(1, files.Count), string.Format("扫描中 {0}/{1}: {2}", idx + 1, files.Count, Path.GetFileName(files[idx])));
             }
+            e.Result = new object[] { files.Count, found };
+        }
+
+        private void ScanWorker_Progress(object sender, ProgressChangedEventArgs e)
+        {
+            lblStatus.Text = e.UserState as string ?? "扫描中...";
+        }
+
+        private void ScanWorker_Completed(object sender, RunWorkerCompletedEventArgs e)
+        {
+            btnScan.Enabled = true;
+            btnConvert.Enabled = true;
+            if (e.Error != null)
+            {
+                lblStatus.Text = "扫描出错";
+                Log("扫描出错: " + e.Error.Message);
+                MessageBox.Show("扫描出错: " + e.Error.Message);
+                return;
+            }
+            if (e.Result is string)
+            {
+                lblStatus.Text = (string)e.Result;
+                MessageBox.Show((string)e.Result);
+                return;
+            }
+            var arr = (object[])e.Result;
+            int total = (int)arr[0];
+            videos = (List<VideoItem>)arr[1];
             RefreshGrid();
-            lblStatus.Text = string.Format("扫描完成: 共 {0} 个视频, 其中 {1} 个时长约3秒", files.Count, count3s);
-            Log(string.Format("扫描 {0}: 共 {1} 个视频文件, 3秒左右的 {2} 个", dir, files.Count, count3s));
+            lblStatus.Text = string.Format("扫描完成: 共 {0} 个视频, 其中 {1} 个时长约3秒", total, videos.Count);
+            Log(string.Format("扫描完成: 共 {0} 个视频文件, 3秒左右的 {1} 个", total, videos.Count));
         }
 
         private double GetDuration(string file)
@@ -173,11 +227,18 @@ namespace Mp4ToMicroVideo
                 { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
                 using (var p = Process.Start(psi))
                 {
-                    var outp = p.StandardOutput.ReadToEnd();
-                    p.WaitForExit(10000);
-                    double d; if (double.TryParse(outp.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return d;
+                    var readTask = p.StandardOutput.ReadToEndAsync();
+                    if (!p.WaitForExit(8000))   // 8 秒超时, 防止坏文件卡死
+                    {
+                        try { p.Kill(); } catch { }
+                        return -1;
+                    }
+                    var outp = readTask.Result;
+                    double d;
+                    if (double.TryParse(outp.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return d;
                 }
-            } catch { }
+            }
+            catch { }
             return -1;
         }
 
@@ -199,13 +260,16 @@ namespace Mp4ToMicroVideo
             return b + " B";
         }
 
-        private void ConvertAll()
+        // ================= 转换 (后台线程) =================
+
+        private void StartConvert()
         {
             if (ffmpegPath == null) { MessageBox.Show("未找到 ffmpeg"); return; }
+            if (convWorker.IsBusy) return;
             var dir = txtDir.Text.Trim();
+            if (dir.Length == 0) { MessageBox.Show("请先选择文件夹"); return; }
             if (videos.Count == 0) { MessageBox.Show("请先扫描"); return; }
 
-            // 收集勾选项
             var toConvert = new List<VideoItem>();
             for (int i = 0; i < grid.Rows.Count; i++)
             {
@@ -216,41 +280,43 @@ namespace Mp4ToMicroVideo
             }
             if (toConvert.Count == 0) { MessageBox.Show("请勾选要转换的视频"); return; }
 
+            btnConvert.Enabled = false;
+            btnScan.Enabled = false;
+            progress.Maximum = toConvert.Count;
+            progress.Value = 0;
+            convWorker.RunWorkerAsync(new object[] { dir, toConvert });
+        }
+
+        private void ConvWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            var worker = (BackgroundWorker)sender;
+            var args = (object[])e.Argument;
+            string dir = (string)args[0];
+            var toConvert = (List<VideoItem>)args[1];
             string outDir = Path.Combine(dir, "LivePhotos");
             Directory.CreateDirectory(outDir);
 
-            progress.Maximum = toConvert.Count;
-            progress.Value = 0;
-            btnConvert.Enabled = false;
             int done = 0, fail = 0;
-
+            var results = new List<ConvResult>();
             foreach (var v in toConvert)
             {
-                lblStatus.Text = "转换中: " + v.Name;
-                Application.DoEvents();
                 string tmpJpg = Path.Combine(Path.GetTempPath(), "lv_frame.jpg");
                 string tmpMp4 = Path.Combine(Path.GetTempPath(), "lv_video.mp4");
                 string outFile = Path.Combine(outDir, "MVIMG_" + Path.GetFileNameWithoutExtension(v.Name) + ".jpg");
-                string rowMsg = "OK";
-
+                var cr = new ConvResult { Path = v.Path, Name = v.Name, OutFile = outFile, Ok = false, Msg = "" };
                 try
                 {
-                    // 时长
                     double dur = v.Duration;
                     double coverTime = 1.5;
                     if (dur < 3.5) coverTime = dur / 2;
                     int coverUs = (int)(coverTime * 1000000);
 
-                    // 抽中间帧
                     Run(ffmpegPath, string.Format("-nostdin -y -loglevel error -ss {0} -i \"{1}\" -frames:v 1 -q:v 2 -huffman default -force_duplicated_matrix 1 \"{2}\"",
                         coverTime.ToString("0.###", CultureInfo.InvariantCulture), v.Path, tmpJpg));
-                    // 转码
                     Run(ffmpegPath, string.Format("-nostdin -y -loglevel error -i \"{0}\" -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -c:a aac -b:a 96k -video_track_timescale 90000 -movflags +faststart \"{1}\"", v.Path, tmpMp4));
 
                     var jpg = File.ReadAllBytes(tmpJpg);
                     var mp4 = File.ReadAllBytes(tmpMp4);
-
-                    // 解析 JPEG 段
                     var segs = ParseSegments(jpg);
                     byte[] dqt = null, dht = null, sof = null, sos = null, jfif = null;
                     foreach (var s in segs)
@@ -262,13 +328,11 @@ namespace Mp4ToMicroVideo
                         else if (s.Marker == 0xE0 && jfif == null) jfif = s.Data;
                     }
 
-                    // 拆 DQT
                     var dqt1 = new byte[69]; dqt1[0] = 0xFF; dqt1[1] = 0xDB; dqt1[2] = 0; dqt1[3] = 67;
                     Array.Copy(dqt, 4, dqt1, 4, 65);
                     var dqt2 = new byte[69]; dqt2[0] = 0xFF; dqt2[1] = 0xDB; dqt2[2] = 0; dqt2[3] = 67;
                     Array.Copy(dqt, 69, dqt2, 4, 65);
 
-                    // 拆 DHT
                     var dhtSegs = new List<byte[]>();
                     int pos = 4;
                     while (pos < dht.Length)
@@ -285,7 +349,6 @@ namespace Mp4ToMicroVideo
                         pos += tableLen;
                     }
 
-                    // XMP
                     string xmpText = MakeXmp(mp4.Length, coverUs);
                     var xmpPrefix = Encoding.ASCII.GetBytes("http://ns.adobe.com/xap/1.0/\0");
                     var xmpBytes = Encoding.UTF8.GetBytes(xmpText);
@@ -296,7 +359,6 @@ namespace Mp4ToMicroVideo
                     Array.Copy(xmpPrefix, 0, xmpSeg, 4, xmpPrefix.Length);
                     Array.Copy(xmpBytes, 0, xmpSeg, 4 + xmpPrefix.Length, xmpBytes.Length);
 
-                    // 组装
                     using (var fs = File.Create(outFile))
                     {
                         fs.WriteByte(0xFF); fs.WriteByte(0xD8);
@@ -310,38 +372,59 @@ namespace Mp4ToMicroVideo
                         if (sos != null) fs.Write(sos, 0, sos.Length);
                         fs.Write(mp4, 0, mp4.Length);
                     }
-
-                    if (grid.Rows.Count > 0)
-                    {
-                        for (int i = 0; i < grid.Rows.Count; i++)
-                        {
-                            var gi = grid.Rows[i].Tag as VideoItem;
-                            if (gi != null && gi.Path == v.Path) { grid.Rows[i].Cells["out"].Value = "✅ 已转换"; break; }
-                        }
-                    }
-                    Log("OK: " + v.Name + " -> " + outFile);
+                    cr.Ok = true;
+                    cr.Msg = "OK";
                 }
                 catch (Exception ex)
                 {
                     fail++;
-                    rowMsg = "失败: " + ex.Message;
-                    for (int i = 0; i < grid.Rows.Count; i++)
-                    {
-                        var gi = grid.Rows[i].Tag as VideoItem;
-                        if (gi != null && gi.Path == v.Path) { grid.Rows[i].Cells["out"].Value = "❌ 失败"; break; }
-                    }
-                    Log("失败: " + v.Name + " : " + ex.Message);
+                    cr.Msg = ex.Message;
                 }
-
                 done++;
-                progress.Value = done;
-                Application.DoEvents();
+                results.Add(cr);
+                worker.ReportProgress(done, cr);
             }
-
-            btnConvert.Enabled = true;
-            lblStatus.Text = string.Format("完成: 成功 {0} 个, 失败 {1} 个", done - fail, fail);
-            MessageBox.Show(string.Format("转换完成!\n成功 {0} 个, 失败 {1} 个\n输出目录: {2}\n\n提示: 用 zip 压缩后发到手机, 微信直发会压缩破坏格式", done - fail, fail, outDir));
+            e.Result = new object[] { done, fail, results };
         }
+
+        private void ConvWorker_Progress(object sender, ProgressChangedEventArgs e)
+        {
+            var cr = e.UserState as ConvResult;
+            progress.Value = e.ProgressPercentage;
+            if (cr != null)
+            {
+                lblStatus.Text = "转换中 " + e.ProgressPercentage + "/" + progress.Maximum + ": " + cr.Name;
+                for (int i = 0; i < grid.Rows.Count; i++)
+                {
+                    var gi = grid.Rows[i].Tag as VideoItem;
+                    if (gi != null && gi.Path == cr.Path)
+                    {
+                        grid.Rows[i].Cells["out"].Value = cr.Ok ? "✅ 已转换" : "❌ 失败";
+                        break;
+                    }
+                }
+                Log((cr.Ok ? "OK: " : "失败: ") + cr.Name + (cr.Ok ? "" : " : " + cr.Msg));
+            }
+        }
+
+        private void ConvWorker_Completed(object sender, RunWorkerCompletedEventArgs e)
+        {
+            btnConvert.Enabled = true;
+            btnScan.Enabled = true;
+            if (e.Error != null)
+            {
+                lblStatus.Text = "转换出错";
+                Log("转换出错: " + e.Error.Message);
+                MessageBox.Show("转换出错: " + e.Error.Message);
+                return;
+            }
+            var arr = (object[])e.Result;
+            int done = (int)arr[0], fail = (int)arr[1];
+            lblStatus.Text = string.Format("完成: 成功 {0} 个, 失败 {1} 个", done - fail, fail);
+            MessageBox.Show(string.Format("转换完成!\n成功 {0} 个, 失败 {1} 个\n\n提示: 用 zip 压缩后发到手机, 微信直发会压缩破坏格式", done - fail, fail));
+        }
+
+        private class ConvResult { public string Path; public string Name; public string OutFile; public bool Ok; public string Msg; }
 
         private List<SegInfo> ParseSegments(byte[] b)
         {
@@ -390,9 +473,16 @@ namespace Mp4ToMicroVideo
             { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
             using (var p = Process.Start(psi))
             {
-                p.StandardOutput.ReadToEnd();
-                p.StandardError.ReadToEnd();
-                if (!p.WaitForExit(60000)) { p.Kill(); throw new Exception("ffmpeg 超时"); }
+                // 异步读输出, 防止管道缓冲死锁 (经典 .NET 坑)
+                var soTask = p.StandardOutput.ReadToEndAsync();
+                var seTask = p.StandardError.ReadToEndAsync();
+                if (!p.WaitForExit(90000))
+                {
+                    try { p.Kill(); } catch { }
+                    throw new Exception("ffmpeg 超时 (90秒)");
+                }
+                soTask.Wait(5000);
+                seTask.Wait(5000);
                 if (p.ExitCode != 0) throw new Exception("ffmpeg 返回码 " + p.ExitCode);
             }
         }
